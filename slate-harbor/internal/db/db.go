@@ -3,11 +3,13 @@ package db
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,6 +21,103 @@ type WalletView struct {
 	Balance        int      `json:"balance"`
 	Inventory      []string `json:"inventory"`
 	ClaimedRewards []string `json:"claimedRewards"`
+}
+
+type CreditResult struct {
+	Status int
+	Body   []byte
+}
+
+// Credit adds currency exactly-once. The idempotency key is claimed in the same
+// transaction as the wallet update and ledger append; a duplicate rolls back and
+// replays the original response.
+
+func Credit(ctx context.Context, pool *pgxpool.Pool, playerID, idemKey, reqHash string, amount int64, reason string) (CreditResult, error) {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return CreditResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// 1. Create the wallet or atomically increment it. The row lock taken by
+	//    ON CONFLICT DO UPDATE prevents lost updates under concurrency.
+	var newBalance int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO wallets (player_id, balance) VALUES ($1, $2)
+		ON CONFLICT (player_id)
+		DO UPDATE SET balance = wallets.balance + EXCLUDED.balance, updated_at = now()
+		RETURNING balance`,
+		playerID, amount,
+	).Scan(&newBalance)
+	if err != nil {
+		return CreditResult{}, fmt.Errorf("upsert wallet: %w", err)
+	}
+
+	// 2. Append to the append-only ledger (audit source of truth).
+	if _, err = tx.Exec(ctx, `
+		INSERT INTO ledger (player_id, delta, reason, ref_type, ref_id, idempotency_key)
+		VALUES ($1, $2, $3, 'credit', NULL, $4)`,
+		playerID, amount, reason, idemKey,
+	); err != nil {
+		return CreditResult{}, fmt.Errorf("insert ledger: %w", err)
+	}
+
+	// 3. The response we intend to return on success.
+	body, err := json.Marshal(map[string]int64{"balance": newBalance})
+	if err != nil {
+		return CreditResult{}, fmt.Errorf("marshal response: %w", err)
+	}
+
+	// 4. Claim the key LAST. A PK collision => duplicate request => roll back all
+	//    work above and replay the original response.
+	if _, err = tx.Exec(ctx, `
+		INSERT INTO idempotency_keys (idempotency_key, request_hash, response_status, response_body)
+		VALUES ($1, $2, $3, $4)`,
+		idemKey, reqHash, 200, body,
+	); err != nil {
+		if isUniqueViolation(err) {
+			tx.Rollback(ctx)
+			return replayResponse(ctx, pool, idemKey, reqHash)
+		}
+		return CreditResult{}, fmt.Errorf("claim idempotency key: %w", err)
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		if isUniqueViolation(err) {
+			return replayResponse(ctx, pool, idemKey, reqHash)
+		}
+		return CreditResult{}, fmt.Errorf("commit: %w", err)
+	}
+	return CreditResult{Status: 200, Body: body}, nil
+}
+
+// replayResponse returns the stored response for an already-seen key. If the same
+// key was reused with a different request body, that's a client bug: reject with 422,
+// never apply the effect.
+func replayResponse(ctx context.Context, pool *pgxpool.Pool, idemKey, reqHash string) (CreditResult, error) {
+	var status int
+	var body []byte
+	var storedHash string
+	if err := pool.QueryRow(ctx, `
+		SELECT response_status, response_body, request_hash
+		FROM idempotency_keys WHERE idempotency_key = $1`, idemKey,
+	).Scan(&status, &body, &storedHash); err != nil {
+		return CreditResult{}, fmt.Errorf("load stored response: %w", err)
+	}
+	if storedHash != reqHash {
+		msg, _ := json.Marshal(map[string]string{"error": "idempotency key reused with a different request"})
+		return CreditResult{Status: 422, Body: msg}, nil
+	}
+	return CreditResult{Status: status, Body: body}, nil
+}
+
+// isUniqueViolation reports whether err is a Postgres unique-constraint violation (23505).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
 }
 
 // GetWallet returns the wallet view for a player as a single consistent
