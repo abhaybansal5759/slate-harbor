@@ -1,0 +1,7 @@
+# binaries
+/bin/
+*.exe
+server
+
+# env / secrets — never commit these
+.env
