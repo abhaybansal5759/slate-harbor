@@ -148,6 +148,22 @@ func Purchase(ctx context.Context, pool *pgxpool.Pool, playerID, idemKey, reqHas
 // Credit adds currency exactly-once. The idempotency key is claimed in the same
 // transaction as the wallet update and ledger append; a duplicate rolls back and
 // replays the original response.
+// Claim grants a reward to a player at most once. The (reward_id, player_id) primary
+// key is the claim-once guarantee: a second claim collides and is reported as
+// already-claimed rather than granting twice. Naturally idempotent — no key header needed.
+// Returns alreadyClaimed=true if this player had already claimed this reward.
+func Claim(ctx context.Context, pool *pgxpool.Pool, rewardID, playerID string) (alreadyClaimed bool, err error) {
+	tag, err := pool.Exec(ctx,
+		`INSERT INTO claimed_rewards (reward_id, player_id) VALUES ($1, $2)
+		 ON CONFLICT (reward_id, player_id) DO NOTHING`,
+		rewardID, playerID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("claim reward: %w", err)
+	}
+	// 0 rows inserted => the row already existed => already claimed.
+	return tag.RowsAffected() == 0, nil
+}
 
 func Credit(ctx context.Context, pool *pgxpool.Pool, playerID, idemKey, reqHash string, amount int64, reason string) (CreditResult, error) {
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})

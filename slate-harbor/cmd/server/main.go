@@ -33,6 +33,55 @@ type purchaseRequest struct {
 	ItemID string `json:"itemId"`
 	Price  int64  `json:"price"`
 }
+type claimRequest struct {
+	PlayerID string `json:"playerId"`
+}
+
+func handleClaim(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rewardID := r.PathValue("rewardId")
+		if rewardID == "" {
+			writeJSONError(w, http.StatusBadRequest, "rewardId is required")
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		var req claimRequest
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if strings.TrimSpace(req.PlayerID) == "" {
+			writeJSONError(w, http.StatusBadRequest, "playerId is required")
+			return
+		}
+
+		already, err := db.Claim(r.Context(), pool, rewardID, req.PlayerID)
+		if err != nil {
+			log.Printf("claim reward=%q player=%q: %v", rewardID, req.PlayerID, err)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		resp := map[string]any{
+			"rewardId":       rewardID,
+			"playerId":       req.PlayerID,
+			"claimed":        true,
+			"alreadyClaimed": already,
+		}
+		body, _ := json.Marshal(resp)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}
+}
+
 
 func handlePurchase(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +222,7 @@ func main() {
 	mux.HandleFunc("GET /v1/wallets/{playerId}", handleGetWallet(pool))
 	mux.HandleFunc("POST /v1/wallets/{playerId}/credit", handleCredit(pool))
 	mux.HandleFunc("POST /v1/wallets/{playerId}/purchase", handlePurchase(pool))
+	mux.HandleFunc("POST /v1/rewards/{rewardId}/claim", handleClaim(pool))
 
 
 	// Readiness: DB is reachable.
