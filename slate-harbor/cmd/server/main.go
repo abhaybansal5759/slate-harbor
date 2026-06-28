@@ -27,6 +27,70 @@ type creditRequest struct {
 	Reason string `json:"reason"`
 }
 
+const maxItemIDLen = 200
+
+type purchaseRequest struct {
+	ItemID string `json:"itemId"`
+	Price  int64  `json:"price"`
+}
+
+func handlePurchase(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		playerID := r.PathValue("playerId")
+		if playerID == "" {
+			writeJSONError(w, http.StatusBadRequest, "playerId is required")
+			return
+		}
+		idemKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if idemKey == "" {
+			writeJSONError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		var req purchaseRequest
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if strings.TrimSpace(req.ItemID) == "" {
+			writeJSONError(w, http.StatusBadRequest, "itemId is required")
+			return
+		}
+		if len(req.ItemID) > maxItemIDLen {
+			writeJSONError(w, http.StatusBadRequest, "itemId too long")
+			return
+		}
+		if req.Price <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "price must be a positive integer")
+			return
+		}
+		if req.Price > maxCreditAmount {
+			writeJSONError(w, http.StatusBadRequest, "price exceeds maximum allowed")
+			return
+		}
+
+		reqHash := hashRequest("purchase", playerID, raw)
+
+		res, err := db.Purchase(r.Context(), pool, playerID, idemKey, reqHash, req.ItemID, req.Price)
+		if err != nil {
+			log.Printf("purchase player=%q key=%q: %v", playerID, idemKey, err)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(res.Status)
+		_, _ = w.Write(res.Body)
+	}
+}
+
 func handleCredit(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		playerID := r.PathValue("playerId")
@@ -108,6 +172,7 @@ func main() {
 
 	mux.HandleFunc("GET /v1/wallets/{playerId}", handleGetWallet(pool))
 	mux.HandleFunc("POST /v1/wallets/{playerId}/credit", handleCredit(pool))
+	mux.HandleFunc("POST /v1/wallets/{playerId}/purchase", handlePurchase(pool))
 
 
 	// Readiness: DB is reachable.

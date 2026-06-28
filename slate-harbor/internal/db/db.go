@@ -27,6 +27,123 @@ type CreditResult struct {
 	Status int
 	Body   []byte
 }
+type PurchaseResult struct {
+	Status int
+	Body   []byte
+}
+
+// Purchase atomically debits price and grants itemId, exactly-once. Insufficient
+// funds is a clean rejection (402) with no partial effect. Concurrent purchases on
+// the same wallet are serialized by SELECT ... FOR UPDATE, so two cannot both spend
+// a balance that affords only one.
+
+
+func Purchase(ctx context.Context, pool *pgxpool.Pool, playerID, idemKey, reqHash, itemID string, price int64) (PurchaseResult, error) {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return PurchaseResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// 0. Idempotency check FIRST. A completed key (success or failure) replays
+	//    immediately — before any funds logic. This is what makes a duplicate of a
+	//    successful purchase return the original response instead of re-evaluating.
+	var seenStatus int
+	var seenBody []byte
+	var seenHash string
+	err = tx.QueryRow(ctx,
+		`SELECT response_status, response_body, request_hash
+		 FROM idempotency_keys WHERE idempotency_key = $1`, idemKey,
+	).Scan(&seenStatus, &seenBody, &seenHash)
+	if err == nil {
+		if seenHash != reqHash {
+			msg, _ := json.Marshal(map[string]string{"error": "idempotency key reused with a different request"})
+			return PurchaseResult{Status: 422, Body: msg}, nil
+		}
+		return PurchaseResult{Status: seenStatus, Body: seenBody}, nil
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return PurchaseResult{}, fmt.Errorf("check idempotency key: %w", err)
+	}
+
+	// 1. Lock the wallet row — serializes concurrent purchases on this wallet.
+	var balance int64
+	err = tx.QueryRow(ctx,
+		`SELECT balance FROM wallets WHERE player_id = $1 FOR UPDATE`, playerID,
+	).Scan(&balance)
+	if errors.Is(err, pgx.ErrNoRows) {
+		balance = 0 // no wallet => can't afford any positive price
+	} else if err != nil {
+		return PurchaseResult{}, fmt.Errorf("lock wallet: %w", err)
+	}
+
+	// 2. Decide the outcome.
+	var status int
+	var body []byte
+	if balance < price {
+		status = 402
+		body, _ = json.Marshal(map[string]any{
+			"error": "insufficient funds", "balance": balance, "price": price,
+		})
+	} else {
+		var newBalance int64
+		if err = tx.QueryRow(ctx,
+			`UPDATE wallets SET balance = balance - $2, updated_at = now()
+			 WHERE player_id = $1 RETURNING balance`,
+			playerID, price,
+		).Scan(&newBalance); err != nil {
+			return PurchaseResult{}, fmt.Errorf("debit: %w", err)
+		}
+		if _, err = tx.Exec(ctx,
+			`INSERT INTO inventory (player_id, item_id, quantity) VALUES ($1, $2, 1)
+			 ON CONFLICT (player_id, item_id)
+			 DO UPDATE SET quantity = inventory.quantity + 1, updated_at = now()`,
+			playerID, itemID,
+		); err != nil {
+			return PurchaseResult{}, fmt.Errorf("grant item: %w", err)
+		}
+		if _, err = tx.Exec(ctx,
+			`INSERT INTO ledger (player_id, delta, reason, ref_type, ref_id, idempotency_key)
+			 VALUES ($1, $2, 'purchase', 'purchase', $3, $4)`,
+			playerID, -price, itemID, idemKey,
+		); err != nil {
+			return PurchaseResult{}, fmt.Errorf("ledger: %w", err)
+		}
+		status = 200
+		body, _ = json.Marshal(map[string]any{"balance": newBalance, "itemId": itemID})
+	}
+
+	// 3. Claim the key with the decided outcome, LAST. A concurrent duplicate that
+	//    slipped past step 0 collides here -> roll back this work, replay the original.
+	if _, err = tx.Exec(ctx,
+		`INSERT INTO idempotency_keys (idempotency_key, request_hash, response_status, response_body)
+		 VALUES ($1, $2, $3, $4)`,
+		idemKey, reqHash, status, body,
+	); err != nil {
+		if isUniqueViolation(err) {
+			tx.Rollback(ctx)
+			r, e := replayResponse(ctx, pool, idemKey, reqHash)
+			return PurchaseResult(r), e
+		}
+		return PurchaseResult{}, fmt.Errorf("claim idempotency key: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		if isUniqueViolation(err) {
+			r, e := replayResponse(ctx, pool, idemKey, reqHash)
+			return PurchaseResult(r), e
+		}
+		return PurchaseResult{}, fmt.Errorf("commit: %w", err)
+	}
+	return PurchaseResult{Status: status, Body: body}, nil
+}
+
+
+// // insufficientFunds builds the 402 rejection body.
+// func insufficientFunds(balance, price int64) (PurchaseResult, error) {
+// 	body, _ := json.Marshal(map[string]any{
+// 		"error": "insufficient funds", "balance": balance, "price": price,
+// 	})
+// 	return PurchaseResult{Status: 402, Body: body}, nil
+// }
 
 // Credit adds currency exactly-once. The idempotency key is claimed in the same
 // transaction as the wallet update and ledger append; a duplicate rolls back and
